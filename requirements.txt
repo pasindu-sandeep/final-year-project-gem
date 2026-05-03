@@ -1,0 +1,5 @@
+streamlit
+pyserial
+requests
+opencv-python
+requests
