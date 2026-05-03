@@ -5,7 +5,7 @@ import base64
 import io
 from streamlit.components.v1 import html
 
-BACKEND_URL = "http://127.0.0.1:5000"
+BACKEND_URL = "http://13.51.195.52:8000"
 
 st.set_page_config(page_title="Gem Image → 3D Model", layout="wide")
 
