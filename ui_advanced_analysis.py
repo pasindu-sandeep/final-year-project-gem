@@ -5,6 +5,8 @@ import base64
 import tempfile
 from collections import defaultdict
 from pathlib import Path
+import serial
+import serial.tools.list_ports
 
 import cv2
 import numpy as np
@@ -29,6 +31,72 @@ from cut_optimizer import optimize_cut_shape
 from hardware_serial import send_command
 
 BACKEND_URL = "http://13.51.195.52:8000"
+
+@st.cache_resource(show_spinner=False)
+def get_arduino():
+    ports = list(serial.tools.list_ports.comports())
+
+    for p in ports:
+        device = (p.device or "").lower()
+        description = (p.description or "").lower()
+        hwid = (p.hwid or "").lower()
+
+        is_arduino_like = any(
+            key in f"{device} {description} {hwid}"
+            for key in ["usbmodem", "usbserial", "ttyacm", "ttyusb", "arduino", "ch340"]
+        )
+
+        if not is_arduino_like:
+            continue
+
+        try:
+            ser = serial.Serial(p.device, 9600, timeout=1)
+            time.sleep(2)
+            return ser, p.device, None
+        except Exception as e:
+            return None, p.device, str(e)
+
+    return None, None, None
+
+
+def render_hardware_status():
+    ser, port, error = get_arduino()
+    st.session_state["ser"] = ser
+
+    with st.sidebar:
+        st.markdown("### Device Status")
+
+        if ser is not None and getattr(ser, "is_open", False):
+            st.success(f"✅ Connected: {port}")
+        elif port and error:
+            st.error(f"❌ Found {port} but failed: {error}")
+        else:
+            st.warning("⚠️ Device not connected")
+
+    return ser
+
+
+def send_motor_signal(action: str) -> bool:
+    ser = st.session_state.get("ser")
+
+    if ser is None or not getattr(ser, "is_open", False):
+        st.warning("Hardware not connected. Motor command was not sent.")
+        return False
+
+    try:
+        if action.upper() == "START":
+            ser.write(b"1")
+        elif action.upper() == "STOP":
+            ser.write(b"0")
+        else:
+            raise ValueError(f"Unknown motor action: {action}")
+
+        ser.flush()
+        return True
+
+    except Exception as e:
+        st.error(f"Motor {action.lower()} failed: {e}")
+        return False
 
 
 def _read_json_or_stop(response: requests.Response, context: str) -> dict:
@@ -496,6 +564,140 @@ def _run_segmentation(
     else:
         st.session_state["segmentation_summary"] = None
 
+def _run_segmentation_on_captured_frames(
+    captured_frames,
+    model,
+    name_map,
+    inclusion_labels,
+    conf,
+    alpha,
+    show_inclusion_fill,
+    show_inclusion_outline,
+    show_gem_outline,
+):
+    if not captured_frames:
+        st.warning("No webcam frames were captured.")
+        return
+
+    results = []
+    summary_results = []
+
+    with st.spinner("Running YOLO predictions on captured webcam images..."):
+        for idx, frame in enumerate(captured_frames):
+            pil_img = Image.fromarray(frame).convert("RGB")
+            H, W = frame.shape[:2]
+
+            r = predict(model, pil_img, conf=conf)
+
+            class_area_sum = defaultdict(int)
+
+            if r.masks is not None and r.boxes is not None and len(r.boxes.cls) > 0:
+                cls_ids = r.boxes.cls.detach().cpu().numpy().astype(int)
+                masks = r.masks.data.detach().cpu().numpy()
+
+                for j, cid in enumerate(cls_ids):
+                    m = _ensure_mask_size((masks[j] > 0.5), (H, W))
+                    class_area_sum[cid] += int(m.sum())
+
+            inclusion_id_set = {i for i, n in name_map.items() if n in inclusion_labels}
+
+            candidates = [
+                (area, cid)
+                for cid, area in class_area_sum.items()
+                if cid not in inclusion_id_set
+            ]
+
+            if not candidates and class_area_sum:
+                candidates = [(area, cid) for cid, area in class_area_sum.items()]
+
+            gem_class_id = max(candidates, key=lambda x: x[0])[1] if candidates else None
+            gem_name = name_map.get(gem_class_id, "Unknown")
+
+            gem_mask = combine_masks_for_ids(
+                r,
+                {gem_class_id} if gem_class_id is not None else set(),
+                (H, W),
+            )
+
+            inclusion_mask = combine_masks_for_ids(
+                r,
+                inclusion_id_set,
+                (H, W),
+            )
+
+            if gem_mask is None:
+                results.append(
+                    {
+                        "filename": f"Captured Image {idx + 1}",
+                        "error": "No gem found.",
+                    }
+                )
+                continue
+
+            overlay = overlay_masks(
+                frame,
+                inclusion_mask,
+                gem_mask,
+                alpha,
+                show_inclusion_fill,
+                show_inclusion_outline,
+                show_gem_outline,
+            )
+
+            gem_area_px = int(gem_mask.sum())
+            inc_area_px = int(inclusion_mask.sum()) if inclusion_mask is not None else 0
+            inc_frac = (inc_area_px / gem_area_px) if gem_area_px > 0 else 0.0
+
+            bbox = axis_aligned_bbox_from_mask(gem_mask)
+            x0, y0, x1, y1, w_px, h_px = bbox if bbox else (0, 0, 0, 0, 0, 0)
+
+            pca = pca_sizes_from_mask(gem_mask)
+            major_px, minor_px = pca if pca else (float(w_px), float(h_px))
+
+            results.append(
+                {
+                    "filename": f"Captured Image {idx + 1}",
+                    "overlay": overlay,
+                    "gem_name": gem_name,
+                    "inc_percent": inc_frac * 100,
+                    "width_px": w_px,
+                    "height_px": h_px,
+                    "major_px": major_px,
+                    "minor_px": minor_px,
+                    "error": None,
+                }
+            )
+
+            summary_results.append(
+                {
+                    "gem_name": gem_name,
+                    "inc_percent": inc_frac * 100,
+                    "width_px": w_px,
+                    "height_px": h_px,
+                }
+            )
+
+    st.session_state["segmentation_results"] = results
+
+    if summary_results:
+        gem_class_counts = defaultdict(int)
+
+        for item in summary_results:
+            gem_class_counts[item["gem_name"]] += 1
+
+        most_common_gem_class = max(gem_class_counts.items(), key=lambda x: x[1])[0]
+        avg_inclusion_percent = sum(item["inc_percent"] for item in summary_results) / len(summary_results)
+        avg_width_px = sum(item["width_px"] for item in summary_results) / len(summary_results)
+        avg_height_px = sum(item["height_px"] for item in summary_results) / len(summary_results)
+
+        st.session_state["segmentation_summary"] = {
+            "gem_class": most_common_gem_class,
+            "avg_inclusion_percent": avg_inclusion_percent,
+            "avg_width_px": avg_width_px,
+            "avg_height_px": avg_height_px,
+        }
+    else:
+        st.session_state["segmentation_summary"] = None
 
 def _render_3d_section(
     model,
@@ -559,17 +761,27 @@ def _render_3d_section(
                     st.write(dimensions)
 
         if generate_clicked:
-            _run_3d_generation(
-                uploaded_file=uploaded_3d_file,
-                model=model,
-                conf=conf,
-                name_map=name_map,
-                inclusion_labels=inclusion_labels,
-                distance_cm=distance_cm,
-                hfov_deg=hfov_deg,
-                script_dir=script_dir,
-                cut_bg_image_path=cut_bg_image_path,
-            )
+            motor_started = send_motor_signal("START")
+
+            if motor_started:
+                st.toast("Motor Started", icon="⚙️")
+
+            try:
+                _run_3d_generation(
+                    uploaded_file=uploaded_3d_file,
+                    model=model,
+                    conf=conf,
+                    name_map=name_map,
+                    inclusion_labels=inclusion_labels,
+                    distance_cm=distance_cm,
+                    hfov_deg=hfov_deg,
+                    script_dir=script_dir,
+                    cut_bg_image_path=cut_bg_image_path,
+                )
+            finally:
+                if motor_started:
+                    send_motor_signal("STOP")
+                    st.toast("Motor Stopped", icon="🛑")
 
     if st.session_state["three_d_glb_data"] is not None:
         st.success("✅ 3D Model Ready!")
@@ -638,15 +850,21 @@ def _render_segmentation_section(
     if capture_webcam_clicked:
         st.markdown("### Webcam Capture")
 
-        if st.session_state.get("ser"):
-            send_command("START")
-            st.toast("Motor Started via Main Controller", icon="⚙️")
-        else:
-            st.warning("Hardware not connected! Motor will not spin. Connect in 'Hardware Controls' tab.")
+        motor_started = send_motor_signal("START")
+
+        if motor_started:
+            st.toast("Motor Started", icon="⚙️")
 
         cap = cv2.VideoCapture(0)
+
         if not cap.isOpened():
             st.error("Webcam not available")
+
+            if motor_started:
+                send_motor_signal("STOP")
+                st.toast("Motor Stopped", icon="🛑")
+
+            cap.release()
         else:
             with st.container(border=True):
                 frame_placeholder = st.empty()
@@ -680,12 +898,25 @@ def _render_segmentation_section(
                         progress_bar.progress((i + 1) / total_images)
                         status_text.write(f"Captured {i + 1}/{total_images}")
                 finally:
-                    if st.session_state.get("ser"):
-                        send_command("STOP")
+                    if motor_started:
+                        send_motor_signal("STOP")
+                        st.toast("Motor Stopped", icon="🛑")
                     cap.release()
 
-            st.success("Capture Complete!")
-            st.session_state["captured_frames"] = captured_frames
+                st.success("Capture Complete!")
+                st.session_state["captured_frames"] = captured_frames
+
+                _run_segmentation_on_captured_frames(
+                    captured_frames=captured_frames,
+                    model=model,
+                    name_map=name_map,
+                    inclusion_labels=inclusion_labels,
+                    conf=conf,
+                    alpha=alpha,
+                    show_inclusion_fill=show_inclusion_fill,
+                    show_inclusion_outline=show_inclusion_outline,
+                    show_gem_outline=show_gem_outline,
+                )
 
     results = st.session_state["segmentation_results"]
     summary = st.session_state["segmentation_summary"]
@@ -736,6 +967,7 @@ def _render_segmentation_section(
 def render_advanced_analysis_page():
     _inject_page_styles()
     _init_state()
+    render_hardware_status()
 
     try:
         script_dir = Path(__file__).resolve().parent
