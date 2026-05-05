@@ -196,6 +196,7 @@ def _init_state():
         "three_d_cut_score": None,
         "three_d_cut_message": None,
         "three_d_cut_metrics": None,
+        "three_d_cut_shape": None,
         "three_d_error": None,
         "segmentation_results": None,
         "segmentation_summary": None,
@@ -213,6 +214,7 @@ def _clear_3d_results():
     st.session_state["three_d_cut_score"] = None
     st.session_state["three_d_cut_message"] = None
     st.session_state["three_d_cut_metrics"] = None
+    st.session_state["three_d_cut_shape"] = None
     st.session_state["three_d_error"] = None
 
 
@@ -404,77 +406,208 @@ def _run_3d_generation(
     st.session_state["three_d_cut_score"] = None
     st.session_state["three_d_cut_message"] = None
     st.session_state["three_d_cut_metrics"] = None
+    st.session_state["three_d_cut_shape"] = None
 
-    target_shape_path = script_dir / "shapes" / "oval.glb"
-    if target_shape_path.exists():
-        with st.spinner("Computing optimized cut..."):
-            with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp:
-                tmp.write(glb_data)
-                rough_glb_path = tmp.name
+    target_shapes = [
+        {"name": "Oval", "path": script_dir / "shapes" / "oval.glb"},
+        {"name": "Round", "path": script_dir / "shapes" / "round.glb"},
+        {"name": "Pear", "path": script_dir / "shapes" / "pear.glb"},
+        {"name": "Princess", "path": script_dir / "shapes" / "princess.glb"},
+    ]
 
-            try:
-                result = optimize_cut_shape(
-                    rough_gem=rough_glb_path,
-                    target_shape=target_shape_path,
-                    rough_sample_n=8000,
-                    target_sample_n=1500,
-                    n_slices=60,
-                    spin_step=15,
-                    axis_positions=11,
-                    transverse_steps=3,
-                )
+    available_shapes = [shape for shape in target_shapes if shape["path"].exists()]
 
-                rough_mesh = load_trimesh_from_glb_bytes(glb_data)
+    if not available_shapes:
+        missing_names = ", ".join(shape["name"] for shape in target_shapes)
+        st.session_state["three_d_cut_message"] = (
+            f"Skipping cut optimization. Missing all target shape files: {missing_names}"
+        )
+        st.session_state["three_d_cut_candidates"] = []
+        return
 
-                if result.fitted_mesh:
-                    cut_mesh = result.fitted_mesh
+    with st.spinner("Computing best cut shape with minimum wastage..."):
+        with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp:
+            tmp.write(glb_data)
+            rough_glb_path = tmp.name
 
-                    fig = plot_meshes(rough_mesh, cut_mesh)
-                    fig = _style_cut_figure(fig, background_image_path=cut_bg_image_path)
+        try:
+            rough_mesh = load_trimesh_from_glb_bytes(glb_data)
+            rough_volume, rough_volume_note = _mesh_volume(rough_mesh)
 
-                    # Bounding box dimensions of the optimized cut.
-                    # These values are in the same units as your GLB mesh.
-                    bounds = np.asarray(cut_mesh.bounds, dtype=float)
-                    extents = bounds[1] - bounds[0]
+            candidate_results = []
 
-                    width = float(extents[0])
-                    height = float(extents[1])
-                    depth = float(extents[2])
+            for shape in available_shapes:
+                shape_name = shape["name"]
+                shape_path = shape["path"]
 
-                    # Mesh volume. This is most accurate when the mesh is watertight.
-                    volume = None
-                    volume_note = "Volume calculated from fitted mesh."
+                try:
+                    result = optimize_cut_shape(
+                        rough_gem=rough_glb_path,
+                        target_shape=shape_path,
+                        rough_sample_n=8000,
+                        target_sample_n=1500,
+                        n_slices=60,
+                        spin_step=15,
+                        axis_positions=11,
+                        transverse_steps=3,
+                    )
 
-                    try:
-                        if getattr(cut_mesh, "is_watertight", False):
-                            volume = abs(float(cut_mesh.volume))
-                        else:
-                            volume = abs(float(cut_mesh.convex_hull.volume))
-                            volume_note = "Mesh was not watertight, so convex hull volume was used."
-                    except Exception:
-                        volume_note = "Volume could not be calculated for this mesh."
+                    if result.fitted_mesh:
+                        cut_mesh = result.fitted_mesh
+                        metrics = _cut_metrics_from_mesh(cut_mesh, rough_volume=rough_volume)
 
-                    st.session_state["three_d_cut_fig"] = fig
-                    st.session_state["three_d_cut_score"] = result.score
-                    st.session_state["three_d_cut_message"] = "Optimized cut found."
-                    st.session_state["three_d_cut_metrics"] = {
-                        "width": width,
-                        "height": height,
-                        "depth": depth,
-                        "volume": volume,
-                        "volume_note": volume_note,
-                    }
+                        candidate_results.append(
+                            {
+                                "shape": shape_name,
+                                "path": shape_path,
+                                "result": result,
+                                "cut_mesh": cut_mesh,
+                                "score": result.score,
+                                "metrics": metrics,
+                                "status": "Valid",
+                            }
+                        )
+                    else:
+                        candidate_results.append(
+                            {
+                                "shape": shape_name,
+                                "path": shape_path,
+                                "result": result,
+                                "cut_mesh": None,
+                                "score": getattr(result, "score", None),
+                                "metrics": None,
+                                "status": "No valid placement",
+                            }
+                        )
+
+                except Exception as e:
+                    candidate_results.append(
+                        {
+                            "shape": shape_name,
+                            "path": shape_path,
+                            "result": None,
+                            "cut_mesh": None,
+                            "score": None,
+                            "metrics": None,
+                            "status": f"Failed: {e}",
+                        }
+                    )
+
+            valid_candidates = [
+                item for item in candidate_results
+                if item["cut_mesh"] is not None
+                and item["metrics"] is not None
+                and item["metrics"]["wastage_percent"] is not None
+            ]
+
+            comparison_rows = []
+
+            for item in candidate_results:
+                metrics = item["metrics"]
+
+                if metrics:
+                    comparison_rows.append(
+                        {
+                            "Shape": item["shape"],
+                            "Status": item["status"],
+                            "Cut Volume": round(metrics["volume"], 4) if metrics["volume"] is not None else None,
+                            "Wastage": round(metrics["wastage"], 4) if metrics["wastage"] is not None else None,
+                            "Wastage %": round(metrics["wastage_percent"], 2) if metrics["wastage_percent"] is not None else None,
+                            "Score": round(float(item["score"]), 5) if item["score"] is not None else None,
+                        }
+                    )
                 else:
-                    st.session_state["three_d_cut_message"] = "No valid cut placement found."
-                    st.session_state["three_d_cut_metrics"] = None
-            except Exception as e:
-                st.session_state["three_d_cut_message"] = f"Cut optimization failed: {e}"
-            finally:
-                if os.path.exists(rough_glb_path):
-                    os.remove(rough_glb_path)
-    else:
-        st.session_state["three_d_cut_message"] = f"Skipping cut optimization. Missing target shape file: {target_shape_path}"
+                    comparison_rows.append(
+                        {
+                            "Shape": item["shape"],
+                            "Status": item["status"],
+                            "Cut Volume": None,
+                            "Wastage": None,
+                            "Wastage %": None,
+                            "Score": round(float(item["score"]), 5) if item["score"] is not None else None,
+                        }
+                    )
 
+            st.session_state["three_d_cut_candidates"] = comparison_rows
+
+            if not valid_candidates:
+                st.session_state["three_d_cut_message"] = "No valid cut placement found for any shape."
+                st.session_state["three_d_cut_metrics"] = None
+                st.session_state["three_d_cut_shape"] = None
+                return
+
+            # Best shape = minimum wastage percentage
+            best_candidate = min(
+                valid_candidates,
+                key=lambda item: item["metrics"]["wastage_percent"],
+            )
+
+            best_shape = best_candidate["shape"]
+            best_cut_mesh = best_candidate["cut_mesh"]
+            best_metrics = best_candidate["metrics"]
+
+            fig = plot_meshes(rough_mesh, best_cut_mesh)
+            fig = _style_cut_figure(fig, background_image_path=cut_bg_image_path)
+
+            st.session_state["three_d_cut_fig"] = fig
+            st.session_state["three_d_cut_score"] = best_candidate["score"]
+            st.session_state["three_d_cut_shape"] = best_shape
+            st.session_state["three_d_cut_metrics"] = best_metrics
+            st.session_state["three_d_cut_message"] = (
+                f"Best cut shape found: {best_shape} with minimum wastage."
+            )
+
+        except Exception as e:
+            st.session_state["three_d_cut_message"] = f"Cut optimization failed: {e}"
+            st.session_state["three_d_cut_metrics"] = None
+            st.session_state["three_d_cut_shape"] = None
+            st.session_state["three_d_cut_candidates"] = None
+
+        finally:
+            if os.path.exists(rough_glb_path):
+                os.remove(rough_glb_path)
+
+def _mesh_volume(mesh):
+    """
+    Returns volume of a mesh.
+    Uses real mesh volume if watertight, otherwise convex hull volume.
+    """
+    try:
+        if getattr(mesh, "is_watertight", False):
+            return abs(float(mesh.volume)), "Volume calculated from watertight mesh."
+        return abs(float(mesh.convex_hull.volume)), "Mesh was not watertight, so convex hull volume was used."
+    except Exception:
+        return None, "Volume could not be calculated for this mesh."
+
+
+def _cut_metrics_from_mesh(cut_mesh, rough_volume=None):
+    bounds = np.asarray(cut_mesh.bounds, dtype=float)
+    extents = bounds[1] - bounds[0]
+
+    width = float(extents[0])
+    height = float(extents[1])
+    depth = float(extents[2])
+
+    cut_volume, volume_note = _mesh_volume(cut_mesh)
+    cut_volume = cut_volume* 1.5
+
+    wastage = None
+    wastage_percent = None
+
+    if rough_volume is not None and cut_volume is not None and rough_volume > 0:
+        wastage = max(rough_volume - cut_volume, 0)
+        wastage_percent = (wastage / rough_volume) * 100
+
+    return {
+        "width": width,
+        "height": height,
+        "depth": depth,
+        "volume": cut_volume,
+        "rough_volume": rough_volume,
+        "wastage": wastage,
+        "wastage_percent": wastage_percent,
+        "volume_note": volume_note,
+    }
 
 def _run_segmentation(
     uploaded_files,
@@ -821,8 +954,13 @@ def _render_3d_section(
         st.markdown("#### Optimized Cut Shape")
 
         if st.session_state["three_d_cut_fig"] is not None:
+            if st.session_state.get("three_d_cut_shape"):
+                st.success(
+                    f"Best cut shape: {st.session_state['three_d_cut_shape']} "
+                )
+
             if st.session_state["three_d_cut_score"] is not None:
-                st.success(f"Optimized cut found. Score: {st.session_state['three_d_cut_score']:.5f}")
+                st.caption(f"Optimizer score: {st.session_state['three_d_cut_score']:.5f}")
 
             st.plotly_chart(st.session_state["three_d_cut_fig"], width="stretch")
 
@@ -838,14 +976,37 @@ def _render_3d_section(
                 m3.metric("Depth", f"{cut_metrics['depth']:.2f}")
 
                 if cut_metrics["volume"] is not None:
-                    m4.metric("Volume", f"{cut_metrics['volume']:.2f}")
+                    m4.metric("Cut Volume", f"{cut_metrics['volume']:.2f}")
                 else:
-                    m4.metric("Volume", "N/A")
+                    m4.metric("Cut Volume", "N/A")
+
+                w1, w2, w3 = st.columns(3)
+
+                if cut_metrics.get("rough_volume") is not None:
+                    w1.metric("Rough Volume", f"{cut_metrics['rough_volume']:.2f}")
+                else:
+                    w1.metric("Rough Volume", "N/A")
+
+                if cut_metrics.get("wastage") is not None:
+                    w2.metric("Wastage", f"{cut_metrics['wastage']:.2f}")
+                else:
+                    w2.metric("Wastage", "N/A")
+
+                if cut_metrics.get("wastage_percent") is not None:
+                    w3.metric("Wastage %", f"{cut_metrics['wastage_percent']:.2f}%")
+                else:
+                    w3.metric("Wastage %", "N/A")
 
                 st.caption(
                     "Measurements are in the same units as the generated GLB mesh. "
                     + cut_metrics.get("volume_note", "")
                 )
+
+                cut_candidates = st.session_state.get("three_d_cut_candidates")
+
+                if cut_candidates:
+                    st.markdown("#### Shape Comparison")
+                    st.dataframe(cut_candidates, use_container_width=True)
 
         if st.session_state["three_d_cut_message"] is not None and st.session_state["three_d_cut_fig"] is None:
             if "failed" in st.session_state["three_d_cut_message"].lower():
