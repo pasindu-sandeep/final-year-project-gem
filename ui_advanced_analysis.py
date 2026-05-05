@@ -195,6 +195,7 @@ def _init_state():
         "three_d_cut_fig": None,
         "three_d_cut_score": None,
         "three_d_cut_message": None,
+        "three_d_cut_metrics": None,
         "three_d_error": None,
         "segmentation_results": None,
         "segmentation_summary": None,
@@ -211,6 +212,7 @@ def _clear_3d_results():
     st.session_state["three_d_cut_fig"] = None
     st.session_state["three_d_cut_score"] = None
     st.session_state["three_d_cut_message"] = None
+    st.session_state["three_d_cut_metrics"] = None
     st.session_state["three_d_error"] = None
 
 
@@ -401,6 +403,7 @@ def _run_3d_generation(
     st.session_state["three_d_cut_fig"] = None
     st.session_state["three_d_cut_score"] = None
     st.session_state["three_d_cut_message"] = None
+    st.session_state["three_d_cut_metrics"] = None
 
     target_shape_path = script_dir / "shapes" / "oval.glb"
     if target_shape_path.exists():
@@ -424,13 +427,46 @@ def _run_3d_generation(
                 rough_mesh = load_trimesh_from_glb_bytes(glb_data)
 
                 if result.fitted_mesh:
-                    fig = plot_meshes(rough_mesh, result.fitted_mesh)
+                    cut_mesh = result.fitted_mesh
+
+                    fig = plot_meshes(rough_mesh, cut_mesh)
                     fig = _style_cut_figure(fig, background_image_path=cut_bg_image_path)
+
+                    # Bounding box dimensions of the optimized cut.
+                    # These values are in the same units as your GLB mesh.
+                    bounds = np.asarray(cut_mesh.bounds, dtype=float)
+                    extents = bounds[1] - bounds[0]
+
+                    width = float(extents[0])
+                    height = float(extents[1])
+                    depth = float(extents[2])
+
+                    # Mesh volume. This is most accurate when the mesh is watertight.
+                    volume = None
+                    volume_note = "Volume calculated from fitted mesh."
+
+                    try:
+                        if getattr(cut_mesh, "is_watertight", False):
+                            volume = abs(float(cut_mesh.volume))
+                        else:
+                            volume = abs(float(cut_mesh.convex_hull.volume))
+                            volume_note = "Mesh was not watertight, so convex hull volume was used."
+                    except Exception:
+                        volume_note = "Volume could not be calculated for this mesh."
+
                     st.session_state["three_d_cut_fig"] = fig
                     st.session_state["three_d_cut_score"] = result.score
                     st.session_state["three_d_cut_message"] = "Optimized cut found."
+                    st.session_state["three_d_cut_metrics"] = {
+                        "width": width,
+                        "height": height,
+                        "depth": depth,
+                        "volume": volume,
+                        "volume_note": volume_note,
+                    }
                 else:
                     st.session_state["three_d_cut_message"] = "No valid cut placement found."
+                    st.session_state["three_d_cut_metrics"] = None
             except Exception as e:
                 st.session_state["three_d_cut_message"] = f"Cut optimization failed: {e}"
             finally:
@@ -761,11 +797,6 @@ def _render_3d_section(
                     st.write(dimensions)
 
         if generate_clicked:
-            motor_started = send_motor_signal("START")
-
-            if motor_started:
-                st.toast("Motor Started", icon="⚙️")
-
             try:
                 _run_3d_generation(
                     uploaded_file=uploaded_3d_file,
@@ -778,10 +809,9 @@ def _render_3d_section(
                     script_dir=script_dir,
                     cut_bg_image_path=cut_bg_image_path,
                 )
-            finally:
-                if motor_started:
-                    send_motor_signal("STOP")
-                    st.toast("Motor Stopped", icon="🛑")
+            except Exception as e:
+                st.error(f"3D generation failed: {e}")
+                return
 
     if st.session_state["three_d_glb_data"] is not None:
         st.success("✅ 3D Model Ready!")
@@ -793,7 +823,29 @@ def _render_3d_section(
         if st.session_state["three_d_cut_fig"] is not None:
             if st.session_state["three_d_cut_score"] is not None:
                 st.success(f"Optimized cut found. Score: {st.session_state['three_d_cut_score']:.5f}")
+
             st.plotly_chart(st.session_state["three_d_cut_fig"], width="stretch")
+
+            cut_metrics = st.session_state.get("three_d_cut_metrics")
+
+            if cut_metrics:
+                st.markdown("#### Cutting Outcome Measurements")
+
+                m1, m2, m3, m4 = st.columns(4)
+
+                m1.metric("Width", f"{cut_metrics['width']:.2f}")
+                m2.metric("Height", f"{cut_metrics['height']:.2f}")
+                m3.metric("Depth", f"{cut_metrics['depth']:.2f}")
+
+                if cut_metrics["volume"] is not None:
+                    m4.metric("Volume", f"{cut_metrics['volume']:.2f}")
+                else:
+                    m4.metric("Volume", "N/A")
+
+                st.caption(
+                    "Measurements are in the same units as the generated GLB mesh. "
+                    + cut_metrics.get("volume_note", "")
+                )
 
         if st.session_state["three_d_cut_message"] is not None and st.session_state["three_d_cut_fig"] is None:
             if "failed" in st.session_state["three_d_cut_message"].lower():
